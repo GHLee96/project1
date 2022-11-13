@@ -18,6 +18,7 @@
 
 #include "ftl.h"
 
+
 struct ftl_stats stats;
 
 static void show_info(void)
