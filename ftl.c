@@ -1,10 +1,10 @@
 /*
- * Lab #4 : DFTL Simulator
- *  - Embedded Systems Design, ICE3028 (Fall, 2021)
+ * Project1 : Custom DFTL Simulator
+ *  - Embedded Systems Design, ICE3028 (Fall, 2022)
  *
- * Oct. 07, 2021.
+ * Nov. 1, 2022.
  *
- * TA: Youngjae Lee, Jeeyoon Jung
+ * TA: Jinwoo Jeong, Jeeyoon Jung
  * Prof: Dongkun Shin
  * Embedded Software Laboratory
  * Sungkyunkwan University
@@ -22,6 +22,9 @@
 #define DATA_BLOCK 1
 #define TR_BLOCK 2
 
+/*
+ * CMT, GTD
+ */
 typedef struct {
 	bool valid;
 	u32 map_page;
@@ -33,6 +36,18 @@ typedef struct {
 CMT_t **CMT;
 static u32 GTD[N_BANKS][N_MAP_PAGES_PB];
 
+/*
+ * Buffer
+ */
+u32 **buffer;
+u32 *buffer_list;
+u32 *buffer_count;
+bool **buffer_sector_valid;
+
+
+/*
+ * State of physical memory
+ */
 typedef struct PAGE_STATE{
 	bool write;
 	bool valid;
@@ -61,6 +76,10 @@ static void map_garbage_collection(u32 bank);
  * and load target L2P in NAND through GTD and increase stats.cache_miss value
  */
 
+
+/*
+ *	Initialize CMT
+ */
 static void init_CMT(u32 bank, u32 cache_slot)
 {
 	CMT[bank][cache_slot].dirty = false;
@@ -443,6 +462,30 @@ void ftl_open()
 		}
 	}
 
+	buffer = malloc(sizeof(u32 *) * N_BUFFERS);
+	buffer_list = malloc(sizeof(u32) * N_BUFFERS);
+	buffer_count = malloc(sizeof(u32));
+	buffer_sector_valid = malloc(sizeof(bool *) * N_BUFFERS);
+
+	for (int depth = 0; depth < N_BUFFERS; depth++) {
+		buffer[depth] = malloc(BUFFER_SIZE / N_BUFFERS);
+		buffer_sector_valid[depth] = malloc(sizeof(bool) * SECTORS_PER_PAGE);
+	}
+
+	for (int depth = 0; depth < N_BUFFERS; depth++)
+	{
+		for (int row = 0; row < SECTORS_PER_PAGE; row++)
+		{
+			buffer_sector_valid[depth][row] = false;
+		} 
+	}
+
+	for (int i = 0 ; i < N_BUFFERS ; i++) {
+		memset(buffer[i], -1, BUFFER_SIZE / N_BUFFERS);
+		buffer_list[i] = -1;
+	}
+	*buffer_count = 0;
+
 	page_state = malloc(sizeof(PAGE_STATE **) * N_BANKS);
 	blk_state = malloc(sizeof(BLOCK_STATE *) * N_BANKS);
 	for (int depth = 0; depth < N_BANKS; depth++)
@@ -470,7 +513,7 @@ void ftl_open()
 			blk_state[depth][row].full = false;
 			blk_state[depth][row].area = 0;
 		} 
-	}	
+	}
 }
 
 void ftl_read(u32 lba, u32 nsect, u32 *read_buffer)
