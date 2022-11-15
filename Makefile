@@ -22,7 +22,7 @@ TAR	= tar
 
 TARGET	= ftl_test
 SRCS	= ftl_test.c ftl.c nand.c
-HEADERS	= nand.h ftl.h
+HEADERS	= nand.h ftl3.h
 OBJS	= $(SRCS:.c=.o)
 
 all: $(OBJS)

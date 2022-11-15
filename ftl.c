@@ -11,7 +11,7 @@
  * http://nyx.skku.ac.kr
  */
 
-#include "ftl.h"
+#include "ftl3.h"
 #include <stdlib.h> 
 #include <string.h>
 #include <stdio.h>
@@ -69,6 +69,8 @@ u32 current_block_user[N_BANKS];
 static u32 ref_time = 0;
 
 static void map_garbage_collection(u32 bank);
+void write(u32 lba, u32 nsect, u32 *write_buf);
+void read(u32 lba, u32 nsect, u32 *read_buf);
 /* DFTL simulator
  * you must make CMT, GTD to use L2P cache
  * you must increase stats.cache_hit value when L2P is in CMT
@@ -531,6 +533,9 @@ void ftl_read(u32 lba, u32 nsect, u32 *read_buffer)
 	u32 M_ppn = 0;
 	u32 *read_data = malloc(PAGE_DATA_SIZE);
 	int *lpn = malloc(sizeof(int));
+	int buffer_i = -1;
+	bool incomplete = false;
+
 	
 	int end_page = (lba + nsect) / SECTORS_PER_PAGE;
 	if ((lba + nsect) % SECTORS_PER_PAGE != 0)
@@ -540,149 +545,94 @@ void ftl_read(u32 lba, u32 nsect, u32 *read_buffer)
 	int npage = end_page - start_page;
 
 	for (int i = 0 ; i < npage; i++) {
-	
+		
+		memset(read_data, -1, SECTOR_SIZE * SECTORS_PER_PAGE);
+
 		*lpn = (lba / SECTORS_PER_PAGE) + i;
 		bank = *lpn % N_BANKS;
 
-		u32 map_page = *lpn / (N_BANKS * N_MAP_ENTRIES_PER_PAGE);
-		u32 map_offset = *lpn % (N_BANKS * N_MAP_ENTRIES_PER_PAGE) / (N_BANKS);
-	 	u32 cmt_index = -1;
-		for (int j = 0; j < N_CACHED_MAP_PAGE_PB; j++) {
-			if (CMT[bank][j].map_page == map_page)
-				cmt_index = j;
-		}
+		incomplete = false;
+		buffer_i = -1;
 
-		memset(read_data, -1, SECTOR_SIZE * SECTORS_PER_PAGE);
-
-		if (cmt_index == -1) 
-		{
-			// CMT에 없을 때 (miss)
-			stats.cache_miss++;
-
-			if (GTD[bank][map_page] == -1)
-			{
-				// NAND에 없을 때
-				memset(read_data, -1, SECTOR_SIZE * SECTORS_PER_PAGE);
-			}
-			else
-			{
-				// NAND에 있을 때
-				u32 spare_lpn;
-				M_ppn = GTD[bank][map_page];
-				
-				M_bank = M_ppn / N_PPNS_PB;
-				M_block = (M_ppn - (N_PPNS_PB * bank)) / PAGES_PER_BLK;
-				M_page = (M_ppn - (N_PPNS_PB * bank)) % PAGES_PER_BLK;		
-
-				u32 *read_data_map = malloc(PAGE_DATA_SIZE);
-				memset(read_data_map, -1, SECTOR_SIZE * SECTORS_PER_PAGE);
-
-				nand_read(M_bank, M_block, M_page, read_data_map, &spare_lpn);
-				stats.nand_read++;
-
-				D_ppn = read_data_map[map_offset];
-				free(read_data_map);
-
-				D_bank = D_ppn / N_PPNS_PB;
-				D_block = (D_ppn - (N_PPNS_PB * bank)) / PAGES_PER_BLK;
-				D_page = (D_ppn - (N_PPNS_PB * bank)) % PAGES_PER_BLK;
-				nand_read(D_bank, D_block, D_page, read_data, &spare_lpn);
-				stats.nand_read++;
-
-				// CMT update
-
-				u32 i_slot = 0;
-				u32 n_vacant_slot = 0;
-
-				// 빈 slot 개수
-				while (i_slot < N_CACHED_MAP_PAGE_PB)
-				{
-					if (CMT[bank][i_slot].valid == false)
-						n_vacant_slot++;
-					i_slot++;
-				}
-
-
-				if (n_vacant_slot == 0) 
-				{
-					// slot 가득 찼을 때
-
-					u32 i_min_val = CMT[bank][0].ref_time;
-					u32 i_min = 0;
-
-					for (int j = 1; j < N_CACHED_MAP_PAGE_PB; j++)
-					{
-						if (CMT[bank][j].ref_time < i_min_val)
-						{
-							i_min = j;
-							i_min_val = CMT[bank][j].ref_time;
+		// buffer에 있는지 확인 
+		for (int j = 0 ; j < *buffer_count ; j++) {
+			if (buffer_list[j] == *lpn) {
+				buffer_i = j;
+				if (i == 0) {
+					offset = lba % SECTORS_PER_PAGE;
+					if (offset + nsect < SECTORS_PER_PAGE)
+						size = nsect * SECTOR_SIZE;
+					else
+						size = PAGE_DATA_SIZE - offset * SECTOR_SIZE;
+					for (int k = offset ; k < offset + size / SECTOR_SIZE ; k++) {
+						if (buffer_sector_valid[j][k] == false) {
+							incomplete = true;
+							break;
 						}
 					}
-
-					// dirty bit check
-					if (CMT[bank][i_min].dirty == true)
-					{
-						// map garbage collection trigger
-						u32 nfull_tr = 0;
-						for (int j = 0 ; j < BLKS_PER_BANK ; j++) {
-							if (blk_state[bank][j].full == true 
-								&& blk_state[bank][j].area == TR_BLOCK) 
-								nfull_tr++;
-						}
-
-						if (nfull_tr == N_MAP_BLOCKS_PB - N_GC_BLOCKS) {
-							map_garbage_collection(bank);
-						}
-
-						// flush
-						map_write(bank, CMT[bank][i_min].map_page, i_min);					
+					if (!incomplete) {
+						memcpy(read_buffer, buffer[j] + offset, size);
+						// read_buffer += SECTORS_PER_PAGE - offset;
+						read_buffer += size / SECTOR_SIZE;
 					}
+				} else if (i == npage - 1) {
+					offset = (lba + nsect) % SECTORS_PER_PAGE;
+					if (offset == 0)
+						size = PAGE_DATA_SIZE;
+					else
+						size = offset * SECTOR_SIZE;
 
-					// load or make
-					map_read(bank, map_page, i_min);
-				}
-				else
-				{
-					// slot 빈자리 있을 때
-					u32 vacant_slot = 0;
-					i_slot = 0;
-					while (CMT[bank][i_slot].valid == true) 
-					{
-						vacant_slot++;
-						i_slot++;
+					for (int k = 0 ; k < size / SECTOR_SIZE ; k++) {
+						if (buffer_sector_valid[j][k] == false) {
+							incomplete = true;
+							break;
+						}
 					}
-					map_read(bank, map_page, vacant_slot);
+					if (!incomplete) {
+						memcpy(read_buffer, buffer[j], size);
+						read_buffer += size / SECTOR_SIZE;
+						// read_buffer -= nsect;
+					}
+				} else {
+					size = PAGE_DATA_SIZE;
+
+					for (int k = 0 ; k < size / SECTOR_SIZE ; k++) {
+						if (buffer_sector_valid[j][k] == false) {
+							incomplete = true;
+							break;
+						}
+					}
+					if (!incomplete) {
+						memcpy(read_buffer, buffer[j], size);
+						read_buffer += SECTORS_PER_PAGE;
+					}
 				}
+				break;
 			}
 		}
-		else
-		{
-			// CMT에 있을 때 (hit)
-			D_ppn = CMT[bank][cmt_index].map_entry[map_offset];
+
+		if (!incomplete && buffer_i != -1) {
+			continue;
+		}
 			
-			if (D_ppn == -1)
-			{
-				memset(read_data, -1, SECTOR_SIZE * SECTORS_PER_PAGE);
-			}
-			
-			u32 spare_lpn;
 
-			D_bank = D_ppn / N_PPNS_PB;
-			D_block = (D_ppn - (N_PPNS_PB * bank)) / PAGES_PER_BLK;
-			D_page = (D_ppn - (N_PPNS_PB * bank)) % PAGES_PER_BLK;
-
-			nand_read(D_bank, D_block, D_page, read_data, &spare_lpn);
-			stats.nand_read++;
-			stats.cache_hit++;
-		}
+		read(*lpn * SECTORS_PER_PAGE, SECTORS_PER_PAGE, read_data);
 
 		if (i == 0) {
 			offset = lba % SECTORS_PER_PAGE;
-			if (nsect + offset < SECTORS_PER_PAGE)
+			if (offset + nsect < SECTORS_PER_PAGE)
 				size = nsect * SECTOR_SIZE;
 			else
 				size = PAGE_DATA_SIZE - offset * SECTOR_SIZE;
 			memcpy(read_buffer, read_data + offset, size);
+			if (incomplete == true) {
+				for (int j = offset ; j < offset + size / SECTOR_SIZE ; j++) {
+					if (buffer_sector_valid[buffer_i][j] == true) {
+						read_buffer[j] = buffer[buffer_i][j];
+					}
+				}
+			}
+			// read_buffer += SECTORS_PER_PAGE - offset;
 			read_buffer += size / SECTOR_SIZE;
 		} else if (i == npage - 1) {
 			offset = (lba + nsect) % SECTORS_PER_PAGE;
@@ -691,14 +641,28 @@ void ftl_read(u32 lba, u32 nsect, u32 *read_buffer)
 			else
 				size = offset * SECTOR_SIZE;
 			memcpy(read_buffer, read_data, size);
+			if (incomplete == true) {
+				for (int j = 0 ; j < size / SECTOR_SIZE ; j++) {
+					if (buffer_sector_valid[buffer_i][j] == true) {
+						read_buffer[j] = buffer[buffer_i][j];
+					}
+				}
+			}
 			read_buffer += size / SECTOR_SIZE;
 		} else {
 			size = PAGE_DATA_SIZE;
 			memcpy(read_buffer, read_data, size);
+			if (incomplete == true) {
+				for (int j = 0 ; j < size / SECTOR_SIZE ; j++) {
+					if (buffer_sector_valid[buffer_i][j] == true) {
+						read_buffer[j] = buffer[buffer_i][j];
+					}
+				}
+			}
 			read_buffer += SECTORS_PER_PAGE;
 		}
 	}
-
+	read_buffer -= nsect;
 	free(read_data);
 	free(lpn);
 	stats.host_read += nsect;
@@ -727,13 +691,312 @@ void ftl_write(u32 lba, u32 nsect, u32 *write_buffer)
 	int npage = end_page - start_page;
 	int offset;
 	int size;
+	int n_hit = 0;
+	bool hit = false;
 
+	*lpn = (lba / SECTORS_PER_PAGE);
+
+	for (int i = start_page; i < end_page; i++) {
+		hit = false;
+		for (int j = 0; j < *buffer_count; j++) {
+			if (buffer_list[j] == i) {
+				// hit
+				hit = true;
+				n_hit++;
+
+				// buffer에 write
+				if (i == start_page) {
+					offset = lba % SECTORS_PER_PAGE;
+					
+					if (nsect + offset < SECTORS_PER_PAGE)
+						size = nsect * SECTOR_SIZE;
+					else 
+						size = PAGE_DATA_SIZE - offset * SECTOR_SIZE;
+
+					memcpy(buffer[j] + offset, write_buffer, size);
+					(*buffer_count)++;
+					
+					for (int k = offset ; k < offset + size / SECTOR_SIZE ; k++)
+						buffer_sector_valid[j][k] = true;
+					
+					write_buffer += size / SECTOR_SIZE;
+				} else if (i == end_page - 1) {
+					offset = (lba + nsect) % SECTORS_PER_PAGE;
+					if (offset == 0) {
+						size = PAGE_DATA_SIZE;
+						memcpy(buffer[j], write_buffer, size);
+						(*buffer_count)++;
+					}
+					else {
+						size = offset * SECTOR_SIZE;
+						memcpy(buffer[j], write_buffer, size);
+						(*buffer_count)++;
+					}
+					for (int k = 0 ; k < size / SECTOR_SIZE ; k++)
+						buffer_sector_valid[j][k] = true;
+				} else {
+					size = PAGE_DATA_SIZE;
+					memcpy(buffer[j], write_buffer, size);
+					(*buffer_count)++;
+					write_buffer += SECTORS_PER_PAGE;
+
+					for (int k = 0 ; k < size / SECTOR_SIZE ; k++)
+						buffer_sector_valid[j][k] = true;
+				}
+
+				break;
+			}
+		}
+
+		if (hit == true) 
+			continue;
+		else {
+			// miss, buffer에 넣기
+			if (*buffer_count == N_BUFFERS) {
+
+				// Buffer 필요한 만큼 비우기
+				int n_victim = 1;
+				for (int i = 0; i < n_victim; i++) {
+					u32 v_lpn = buffer_list[i];
+					bank = v_lpn % N_BANKS;
+					memset(write_data, -1, PAGE_DATA_SIZE);
+
+					read(v_lpn * SECTORS_PER_PAGE, SECTORS_PER_PAGE, write_data);
+
+					for (int j = 0; j < SECTORS_PER_PAGE; j++) {
+						if (buffer_sector_valid[i][j] == true) {
+							write_data[j] = buffer[i][j];
+						}
+					}
+
+					// flush
+					write(v_lpn * SECTORS_PER_PAGE, SECTORS_PER_PAGE, write_data);
+				}
+
+				// Buffer 재배열
+				for (int j = 0 ; j < *buffer_count - n_victim ; j++) {
+					buffer_list[j] = buffer_list[j + n_victim];
+					memcpy(buffer[j], buffer[j + n_victim], PAGE_DATA_SIZE);
+					memcpy(buffer_sector_valid[j], buffer_sector_valid[j + n_victim], sizeof(bool) * SECTORS_PER_PAGE);
+				}
+				
+				(*buffer_count) -= n_victim;
+
+				// 비운 buffer init
+				for (int j = *buffer_count ; j < N_BUFFERS ; j++) {
+					for (int k = 0 ; k < SECTORS_PER_PAGE ; k++) {
+						buffer_sector_valid[j][k] = false;
+					}
+					memset(buffer[j], -1, PAGE_DATA_SIZE);
+					buffer_list[j] = -1;
+				}
+			}
+						
+			read((*lpn) * SECTORS_PER_PAGE, SECTORS_PER_PAGE, buffer[*buffer_count]);
+
+			// buffer에 write
+			if (i == start_page) {
+				offset = lba % SECTORS_PER_PAGE;
+				
+				if (nsect + offset < SECTORS_PER_PAGE)
+					size = nsect * SECTOR_SIZE;
+				else 
+					size = PAGE_DATA_SIZE - offset * SECTOR_SIZE;
+
+				memcpy(buffer[*buffer_count] + offset, write_buffer, size);
+				(*buffer_count)++;
+				
+				for (int j = offset ; j < offset + size / SECTOR_SIZE ; j++)
+					buffer_sector_valid[*buffer_count][j] = true;
+				
+				write_buffer += size / SECTOR_SIZE;
+			} else if (i == end_page - 1) {
+				offset = (lba + nsect) % SECTORS_PER_PAGE;
+				if (offset == 0) {
+					size = PAGE_DATA_SIZE;
+					memcpy(buffer[*buffer_count], write_buffer, size);
+					(*buffer_count)++;
+				}
+				else {
+					size = offset * SECTOR_SIZE;
+					memcpy(buffer[*buffer_count], write_buffer, size);
+					(*buffer_count)++;
+				}
+				for (int j = 0 ; j < size / SECTOR_SIZE ; j++)
+					buffer_sector_valid[*buffer_count][j] = true;
+			} else {
+				size = PAGE_DATA_SIZE;
+				memcpy(buffer[*buffer_count], write_buffer, size);
+				(*buffer_count)++;
+				write_buffer += SECTORS_PER_PAGE;
+
+				for (int j = 0 ; j < size / SECTOR_SIZE ; j++)
+					buffer_sector_valid[*buffer_count][j] = true;
+			}
+			
+			int valid_count = 0;
+			for (int j = 0 ; j < SECTORS_PER_PAGE ; j++) {
+				if (buffer_sector_valid[*buffer_count][j] == true)
+					valid_count++;
+			}
+
+			buffer_list[*buffer_count] = *lpn;
+			(*buffer_count)++;
+			(*lpn)++;
+		}
+	}
+
+	
+
+	
+
+/* 	// Buffer에 넣기
+	if (npage - n_hit <= N_BUFFERS) {
+
+		// Buffer 필요한 만큼 비우기
+		if (npage - n_hit > N_BUFFERS - *buffer_count) {
+			int n_victim = npage - (N_BUFFERS - *buffer_count);
+			for (int i = 0; i < n_victim; i++) {
+				*lpn = buffer_list[i];
+				bank = *lpn % N_BANKS;
+				memset(write_data, -1, PAGE_DATA_SIZE);
+
+				for (int j = 0; j < SECTORS_PER_PAGE; j++) {
+					if (buffer_sector_valid[i][j] == true) {
+						write_data[j] = buffer[i][j];
+					}
+				}
+
+				// flush
+				write((*lpn) * SECTORS_PER_PAGE, SECTORS_PER_PAGE, write_data);
+			}
+
+			// Buffer 재배열
+			for (int j = 0 ; j < *buffer_count - n_victim ; j++) {
+				buffer_list[j] = buffer_list[j + n_victim];
+				memcpy(buffer[j], buffer[j + n_victim], PAGE_DATA_SIZE);
+				memcpy(buffer_sector_valid[j], buffer_sector_valid[j + n_victim], sizeof(bool) * SECTORS_PER_PAGE);
+			}
+			
+			(*buffer_count) -= n_victim;
+
+			// 비운 buffer init
+			for (int j = *buffer_count ; j < N_BUFFERS ; j++) {
+				for (int k = 0 ; k < SECTORS_PER_PAGE ; k++) {
+					buffer_sector_valid[j][k] = false;
+				}
+				memset(buffer[j], -1, PAGE_DATA_SIZE);
+				buffer_list[j] = -1;
+			}
+		}
+
+		int start = *buffer_count;
+		int n = start;
+		*lpn = (lba / SECTORS_PER_PAGE);
+		
+		// Buffer에 넣기
+		for (int i = 0 ; i < npage ; i++) {
+			int tmp = -1;
+			for (int j = 0 ; j < *buffer_count ; j++) {
+				if (buffer_list[j] == *lpn) {
+					tmp = n;
+					n = j;
+				}
+			}
+			
+			if (i == 0) {
+				offset = lba % SECTORS_PER_PAGE;
+				
+				if (nsect + offset < SECTORS_PER_PAGE)
+					size = nsect * SECTOR_SIZE;
+				else 
+					size = PAGE_DATA_SIZE - offset * SECTOR_SIZE;
+
+				memcpy(buffer[n] + offset, write_buffer, size);
+				(*buffer_count)++;
+				
+				for (int j = offset ; j < offset + size / SECTOR_SIZE ; j++)
+					buffer_sector_valid[n][j] = true;
+				
+				write_buffer += size / SECTOR_SIZE;
+			} else if (i == npage - 1) {
+				offset = (lba + nsect) % SECTORS_PER_PAGE;
+				if (offset == 0) {
+					size = PAGE_DATA_SIZE;
+					memcpy(buffer[n], write_buffer, size);
+					(*buffer_count)++;
+				}
+				else {
+					size = offset * SECTOR_SIZE;
+					memcpy(buffer[n], write_buffer, size);
+					(*buffer_count)++;
+				}
+				for (int j = 0 ; j < size / SECTOR_SIZE ; j++)
+					buffer_sector_valid[n][j] = true;
+			} else {
+				size = PAGE_DATA_SIZE;
+				memcpy(buffer[n], write_buffer, size);
+				(*buffer_count)++;
+				write_buffer += SECTORS_PER_PAGE;
+
+				for (int j = 0 ; j < size / SECTOR_SIZE ; j++)
+					buffer_sector_valid[n][j] = true;
+			}
+			
+			int valid_count = 0;
+			for (int j = 0 ; j < SECTORS_PER_PAGE ; j++) {
+				if (buffer_sector_valid[n][j] == true)
+					valid_count++;
+			}
+
+			buffer_list[n] = *lpn;
+			if (tmp != -1) {
+				n = tmp;
+				(*buffer_count)--;
+			}
+				
+			else 
+				n++;
+
+			(*lpn)++;
+		}
+	} else {
+		write(lba, nsect, write_buffer);
+	} */
+	free(lpn);
+	free(write_data);
+	stats.host_write += nsect;
+	ref_time++;
+	return;
+}
+
+void write(u32 lba, u32 nsect, u32 *write_buf) 
+{
+	int *lpn_ = malloc(sizeof(int));
+	u32 D_ppn = 0;
+	int bank;
+	int D_block;
+	int D_page;
+	int old_D_ppn = -1;
+	int old_bank;
+	int old_block;
+	int old_page;
+	u32 *write_data_ = malloc(PAGE_DATA_SIZE);
+
+	int end_page = (lba + nsect) / SECTORS_PER_PAGE;
+	if ((lba + nsect) % SECTORS_PER_PAGE != 0)
+		end_page++;
+
+	int start_page = lba / SECTORS_PER_PAGE;
+	int npage = end_page - start_page;
+	int offset;
+	int size;
 
 	for (int i = 0 ; i < npage; i++) {
-		memset(write_data, -1, PAGE_DATA_SIZE);
+		memset(write_data_, -1, PAGE_DATA_SIZE);
 
-		*lpn = (lba / SECTORS_PER_PAGE) + i;
-		bank = *lpn % N_BANKS;
+		*lpn_ = (lba / SECTORS_PER_PAGE) + i;
+		bank = *lpn_ % N_BANKS;
 
 		u32 nfull_data = 0;
 		for (int j = 0 ; j < BLKS_PER_BANK ; j++) {
@@ -768,8 +1031,8 @@ void ftl_write(u32 lba, u32 nsect, u32 *write_buffer)
 		D_ppn = (N_PPNS_PB * bank) + (PAGES_PER_BLK * D_block) + D_page;
 		blk_state[bank][D_block].area = DATA_BLOCK;
 
-		u32 map_page = *lpn / (N_BANKS * N_MAP_ENTRIES_PER_PAGE);
-		u32 map_offset = *lpn % (N_BANKS * N_MAP_ENTRIES_PER_PAGE) / (N_BANKS);
+		u32 map_page = *lpn_ / (N_BANKS * N_MAP_ENTRIES_PER_PAGE);
+		u32 map_offset = *lpn_ % (N_BANKS * N_MAP_ENTRIES_PER_PAGE) / (N_BANKS);
 	 	u32 cmt_index = -1;
 
 		for (int j = 0; j < N_CACHED_MAP_PAGE_PB; j++) {
@@ -903,7 +1166,7 @@ void ftl_write(u32 lba, u32 nsect, u32 *write_buffer)
 			if (blk_state[old_bank][old_block].nvalid > 0)
 				blk_state[old_bank][old_block].nvalid--;
 
-			nand_read(old_bank, old_block, old_page, write_data, &spare_lpn);
+			nand_read(old_bank, old_block, old_page, write_data_, &spare_lpn);
 			stats.nand_read++;
 		}
 
@@ -915,27 +1178,27 @@ void ftl_write(u32 lba, u32 nsect, u32 *write_buffer)
 				size = nsect * SECTOR_SIZE;
 			else 
 				size = PAGE_DATA_SIZE - offset * SECTOR_SIZE;
-			memcpy(write_data + offset, write_buffer, size);
-			write_buffer += size / SECTOR_SIZE;
+			memcpy(write_data_ + offset, write_buf, size);
+			write_buf += size / SECTOR_SIZE;
 		} else if (i == npage - 1) {
 			offset = (lba + nsect) % SECTORS_PER_PAGE;
 			if (offset == 0) {
 				size = PAGE_DATA_SIZE;
-				memcpy(write_data, write_buffer, size);
+				memcpy(write_data_, write_buf, size);
 			}
 			else {
 				size = offset * SECTOR_SIZE;
-				memcpy(write_data, write_buffer, size);
-				write_buffer += SECTORS_PER_PAGE;
+				memcpy(write_data_, write_buf, size);
+				write_buf += SECTORS_PER_PAGE;
 			}
 				
 		} else {
 			size = PAGE_DATA_SIZE;
-			memcpy(write_data, write_buffer, size);
-			write_buffer += SECTORS_PER_PAGE;
+			memcpy(write_data_, write_buf, size);
+			write_buf += SECTORS_PER_PAGE;
 		}
 
-		nand_write(bank, D_block, D_page, write_data, lpn);
+		nand_write(bank, D_block, D_page, write_data_, lpn_);
 		stats.nand_write++;
 
 		page_state[bank][D_block][D_page].write = true;
@@ -947,9 +1210,200 @@ void ftl_write(u32 lba, u32 nsect, u32 *write_buffer)
 			current_block_user[bank] = -1;
 		}
 	}
-	free(lpn);
-	free(write_data);
-	stats.host_write += nsect;
-	ref_time++;
+
+	free(lpn_);
+	free(write_data_);
 	return;
 }
+
+
+void read(u32 lba, u32 nsect, u32 *read_buf)
+{	
+	int bank;
+	int D_bank;
+	int D_block;
+	int D_page;
+	int M_bank;
+	int M_block;
+	int M_page;
+	u32 offset;
+	u32 size;
+	u32 D_ppn = 0;
+	u32 M_ppn = 0;
+	u32 *read_data_ = malloc(PAGE_DATA_SIZE);
+	int *lpn_ = malloc(sizeof(int));
+	
+	int end_page = (lba + nsect) / SECTORS_PER_PAGE;
+	if ((lba + nsect) % SECTORS_PER_PAGE != 0)
+		end_page++;
+
+	int start_page = lba / SECTORS_PER_PAGE;
+	int npage = end_page - start_page;
+
+	for (int i = 0 ; i < npage; i++) {
+	
+		*lpn_ = (lba / SECTORS_PER_PAGE) + i;
+		bank = *lpn_ % N_BANKS;
+
+		u32 map_page = *lpn_ / (N_BANKS * N_MAP_ENTRIES_PER_PAGE);
+		u32 map_offset = *lpn_ % (N_BANKS * N_MAP_ENTRIES_PER_PAGE) / (N_BANKS);
+	 	u32 cmt_index = -1;
+		for (int j = 0; j < N_CACHED_MAP_PAGE_PB; j++) {
+			if (CMT[bank][j].map_page == map_page)
+				cmt_index = j;
+		}
+
+		memset(read_data_, -1, SECTOR_SIZE * SECTORS_PER_PAGE);
+
+		if (cmt_index == -1) 
+		{
+			// CMT에 없을 때 (miss)
+			stats.cache_miss++;
+
+			if (GTD[bank][map_page] == -1)
+			{
+				// NAND에 없을 때
+				memset(read_data_, -1, SECTOR_SIZE * SECTORS_PER_PAGE);
+			}
+			else
+			{
+				// NAND에 있을 때
+				u32 spare_lpn;
+				M_ppn = GTD[bank][map_page];
+				
+				M_bank = M_ppn / N_PPNS_PB;
+				M_block = (M_ppn - (N_PPNS_PB * bank)) / PAGES_PER_BLK;
+				M_page = (M_ppn - (N_PPNS_PB * bank)) % PAGES_PER_BLK;		
+
+				u32 *read_data_map = malloc(PAGE_DATA_SIZE);
+				memset(read_data_map, -1, SECTOR_SIZE * SECTORS_PER_PAGE);
+
+				nand_read(M_bank, M_block, M_page, read_data_map, &spare_lpn);
+				stats.nand_read++;
+
+				D_ppn = read_data_map[map_offset];
+				free(read_data_map);
+
+				D_bank = D_ppn / N_PPNS_PB;
+				D_block = (D_ppn - (N_PPNS_PB * bank)) / PAGES_PER_BLK;
+				D_page = (D_ppn - (N_PPNS_PB * bank)) % PAGES_PER_BLK;
+				nand_read(D_bank, D_block, D_page, read_data_, &spare_lpn);
+				stats.nand_read++;
+
+				// CMT update
+
+				u32 i_slot = 0;
+				u32 n_vacant_slot = 0;
+
+				// 빈 slot 개수
+				while (i_slot < N_CACHED_MAP_PAGE_PB)
+				{
+					if (CMT[bank][i_slot].valid == false)
+						n_vacant_slot++;
+					i_slot++;
+				}
+
+
+				if (n_vacant_slot == 0) 
+				{
+					// slot 가득 찼을 때
+
+					u32 i_min_val = CMT[bank][0].ref_time;
+					u32 i_min = 0;
+
+					for (int j = 1; j < N_CACHED_MAP_PAGE_PB; j++)
+					{
+						if (CMT[bank][j].ref_time < i_min_val)
+						{
+							i_min = j;
+							i_min_val = CMT[bank][j].ref_time;
+						}
+					}
+
+					// dirty bit check
+					if (CMT[bank][i_min].dirty == true)
+					{
+						// map garbage collection trigger
+						u32 nfull_tr = 0;
+						for (int j = 0 ; j < BLKS_PER_BANK ; j++) {
+							if (blk_state[bank][j].full == true 
+								&& blk_state[bank][j].area == TR_BLOCK) 
+								nfull_tr++;
+						}
+
+						if (nfull_tr == N_MAP_BLOCKS_PB - N_GC_BLOCKS) {
+							map_garbage_collection(bank);
+						}
+
+						// flush
+						map_write(bank, CMT[bank][i_min].map_page, i_min);					
+					}
+
+					// load or make
+					map_read(bank, map_page, i_min);
+				}
+				else
+				{
+					// slot 빈자리 있을 때
+					u32 vacant_slot = 0;
+					i_slot = 0;
+					while (CMT[bank][i_slot].valid == true) 
+					{
+						vacant_slot++;
+						i_slot++;
+					}
+					map_read(bank, map_page, vacant_slot);
+				}
+			}
+		}
+		else
+		{
+			// CMT에 있을 때 (hit)
+			D_ppn = CMT[bank][cmt_index].map_entry[map_offset];
+			
+			if (D_ppn == -1)
+			{
+				memset(read_data_, -1, SECTOR_SIZE * SECTORS_PER_PAGE);
+			}
+			
+			u32 spare_lpn;
+
+			D_bank = D_ppn / N_PPNS_PB;
+			D_block = (D_ppn - (N_PPNS_PB * bank)) / PAGES_PER_BLK;
+			D_page = (D_ppn - (N_PPNS_PB * bank)) % PAGES_PER_BLK;
+
+			nand_read(D_bank, D_block, D_page, read_data_, &spare_lpn);
+			stats.nand_read++;
+			stats.cache_hit++;
+		}
+
+		if (i == 0) {
+			offset = lba % SECTORS_PER_PAGE;
+			if (nsect + offset < SECTORS_PER_PAGE)
+				size = nsect * SECTOR_SIZE;
+			else
+				size = PAGE_DATA_SIZE - offset * SECTOR_SIZE;
+			memcpy(read_buf, read_data_ + offset, size);
+			read_buf += size / SECTOR_SIZE;
+		} else if (i == npage - 1) {
+			offset = (lba + nsect) % SECTORS_PER_PAGE;
+			if (offset == 0)
+				size = PAGE_DATA_SIZE;
+			else
+				size = offset * SECTOR_SIZE;
+			memcpy(read_buf, read_data_, size);
+			read_buf += size / SECTOR_SIZE;
+		} else {
+			size = PAGE_DATA_SIZE;
+			memcpy(read_buf, read_data_, size);
+			read_buf += SECTORS_PER_PAGE;
+		}
+	}
+	read_buf -= nsect;
+
+	free(read_data_);
+	free(lpn_);
+	stats.host_read += nsect;
+	return;
+}
+

@@ -16,7 +16,7 @@
 #include <string.h>
 #include <stdbool.h>
 
-#include "ftl.h"
+#include "ftl3.h"
 #include "nand.h"
 
 /*

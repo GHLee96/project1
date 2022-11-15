@@ -16,7 +16,7 @@
 #include <string.h>
 #include <assert.h>
 
-#include "ftl.h"
+#include "ftl3.h"
 
 
 struct ftl_stats stats;
